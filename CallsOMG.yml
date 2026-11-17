@@ -1,0 +1,1675 @@
+# Сохраните файл в репозитории как .github/workflows/build-ipa.yml.
+# Коммит запускает сборку без подписи. Повторный запуск доступен во вкладке Actions.
+# Для подписанного IPA добавьте в Settings → Secrets and variables → Actions:
+#   IOS_CERTIFICATE_P12_BASE64 — Apple Distribution .p12, закодированный в Base64
+#   IOS_CERTIFICATE_PASSWORD — пароль файла .p12
+#   IOS_PROVISIONING_PROFILE_BASE64 — Ad Hoc .mobileprovision, закодированный в Base64
+# В профиле должны быть зарегистрированный iPhone и сертификат из .p12.
+# Затем выберите Run workflow и включите Sign for iPhone.
+
+name: Build Perezvon IPA
+
+on:
+  push:
+    paths:
+      - .github/workflows/build-ipa.yml
+  workflow_dispatch:
+    inputs:
+      sign_for_iphone:
+        description: Sign for iPhone (Apple Ad Hoc)
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build iOS application
+    runs-on: macos-15
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare Xcode and XcodeGen
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Prepare Apple Ad Hoc signing
+        if: inputs.sign_for_iphone == true
+        env:
+          CERTIFICATE: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -u
+          if [[ -z "$CERTIFICATE" || -z "$PROFILE" ]]; then
+            echo "::error::Set IOS_CERTIFICATE_P12_BASE64 and IOS_PROVISIONING_PROFILE_BASE64 in repository Actions secrets."
+            exit 1
+          fi
+
+          signing_dir="$RUNNER_TEMP/perezvon-signing"
+          mkdir -p "$signing_dir"
+          chmod 700 "$signing_dir"
+
+          printf '%s' "$CERTIFICATE" | /usr/bin/base64 -D > "$signing_dir/certificate.p12"
+          printf '%s' "$PROFILE" | /usr/bin/base64 -D > "$signing_dir/profile.mobileprovision"
+          /usr/bin/security cms -D -i "$signing_dir/profile.mobileprovision" > "$signing_dir/profile.plist"
+
+          keychain="$signing_dir/build.keychain-db"
+          keychain_password="$(/usr/bin/openssl rand -hex 32)"
+          /usr/bin/security create-keychain -p "$keychain_password" "$keychain"
+          /usr/bin/security set-keychain-settings -lut 3600 "$keychain"
+          /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain"
+          /usr/bin/security import "$signing_dir/certificate.p12" -P "$CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          rm "$signing_dir/certificate.p12"
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+          /usr/bin/security list-keychains -d user -s "$keychain"
+          /usr/bin/security find-identity -v -p codesigning "$keychain" > "$signing_dir/identities.txt"
+
+          python3 - "$signing_dir" <<'SIGNING_PY'
+          import hashlib
+          import os
+          import plistlib
+          import re
+          import shutil
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          directory = Path(sys.argv[1])
+          with (directory / "profile.plist").open("rb") as stream:
+              profile = plistlib.load(stream)
+          entitlements = profile["Entitlements"]
+          expiration = profile["ExpirationDate"].replace(tzinfo=timezone.utc)
+          if expiration <= datetime.now(timezone.utc):
+              sys.exit("The Apple provisioning profile has expired.")
+          if (entitlements.get("get-task-allow") or not profile.get("ProvisionedDevices")
+                  or profile.get("ProvisionsAllDevices")):
+              sys.exit("Use an iOS Ad Hoc distribution profile with registered device UDIDs.")
+
+          profile_id = profile["UUID"]
+          team_id = profile["TeamIdentifier"][0]
+          bundle_id = entitlements["application-identifier"].partition(".")[2]
+          if not re.fullmatch(r"[0-9A-Fa-f-]{36}", profile_id):
+              sys.exit("Invalid provisioning profile UUID.")
+          if not re.fullmatch(r"[A-Z0-9]{10}", team_id):
+              sys.exit("Invalid Apple Team ID.")
+          if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", bundle_id):
+              sys.exit("Create the Ad Hoc profile for an explicit App ID, without a wildcard.")
+
+          profile_identities = {
+              hashlib.sha1(certificate).hexdigest().upper()
+              for certificate in profile["DeveloperCertificates"]
+          }
+          keychain_identities = re.findall(r"\b[0-9A-F]{40}\b", (directory / "identities.txt").read_text())
+          cert_id = next((identity for identity in keychain_identities if identity in profile_identities), None)
+          if cert_id is None:
+              sys.exit("No valid signing identity in the .p12 matches the Ad Hoc profile.")
+
+          for relative in (
+              "Library/Developer/Xcode/UserData/Provisioning Profiles",
+              "Library/MobileDevice/Provisioning Profiles",
+          ):
+              profile_dir = Path.home() / relative
+              profile_dir.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(directory / "profile.mobileprovision", profile_dir / f"{profile_id}.mobileprovision")
+
+          export_options = directory / "ExportOptions.plist"
+          with export_options.open("wb") as stream:
+              plistlib.dump({
+                  "method": "release-testing",
+                  "signingStyle": "manual",
+                  "teamID": team_id,
+                  "signingCertificate": cert_id,
+                  "provisioningProfiles": {bundle_id: profile_id},
+              }, stream)
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+              for key, value in {
+                  "PEREZVON_BUNDLE_ID": bundle_id,
+                  "PEREZVON_TEAM_ID": team_id,
+                  "PEREZVON_CERT_ID": cert_id,
+                  "PEREZVON_PROFILE_ID": profile_id,
+                  "PEREZVON_EXPORT_OPTIONS": str(export_options),
+              }.items():
+                  print(f"{key}={value}", file=stream)
+          SIGNING_PY
+
+      - name: Generate project and build IPA
+        id: package
+        run: |
+          set -u
+          project_dir="$RUNNER_TEMP/perezvon-project"
+          output_dir="$RUNNER_TEMP/perezvon-output"
+          mkdir -p "$project_dir/Perezvon" "$output_dir"
+          cd "$project_dir"
+
+          cat > Perezvon/PerezvonApp.swift <<'PEREZVON_SWIFT'
+          // PerezvonApp.swift
+          // Xcode → iOS App → SwiftUI. iOS 17+.
+          // Replace the generated Swift app and ContentView files with this single file.
+
+          import Combine
+          import SwiftUI
+          import UIKit
+          import UserNotifications
+
+          // MARK: - Records
+
+          private enum LeadStage: String, CaseIterable, Codable, Identifiable {
+              case new, working, proposal, won, closed
+
+              var id: Self { self }
+
+              var title: String {
+                  switch self {
+                  case .new: "Новый"
+                  case .working: "В работе"
+                  case .proposal: "КП отправлено"
+                  case .won: "Договор"
+                  case .closed: "Закрыт"
+                  }
+              }
+          }
+
+          private enum ReminderKind: String, CaseIterable, Codable, Identifiable {
+              case call, task
+
+              var id: Self { self }
+              var title: String { self == .call ? "Звонок" : "Задача" }
+              var symbol: String { self == .call ? "phone" : "bell" }
+          }
+
+          private enum CallOutcome: String, CaseIterable, Codable, Identifiable {
+              case answered, noAnswer, callBack, declined
+
+              var id: Self { self }
+
+              var title: String {
+                  switch self {
+                  case .answered: "Дозвонился"
+                  case .noAnswer: "Не ответил"
+                  case .callBack: "Просит перезвонить"
+                  case .declined: "Отказ"
+                  }
+              }
+          }
+
+          private struct Lead: Codable, Identifiable {
+              var id = UUID()
+              var name = ""
+              var contact = ""
+              var phone = ""
+              var stage: LeadStage = .new
+
+              var dialURL: URL? {
+                  let number = phone.trimmed
+                  let hasPrefix = number.hasPrefix("+")
+                  let local = hasPrefix ? String(number.dropFirst()) : number
+                  guard local.allSatisfy({ "0123456789() -.".contains($0) || $0.isWhitespace }) else { return nil }
+                  let digits = local.filter { "0123456789".contains($0) }
+                  guard (5...15).contains(digits.count) else { return nil }
+                  let prefix = hasPrefix ? "+" : ""
+                  return URL(string: "tel:\(prefix)\(digits)")
+              }
+          }
+
+          private struct Reminder: Codable, Identifiable {
+              var id = UUID()
+              var leadID: UUID?
+              var title = ""
+              var kind: ReminderKind = .call
+              var due = Date().addingTimeInterval(3_600)
+              var completed = false
+          }
+
+          private struct Note: Codable, Identifiable {
+              var id = UUID()
+              var leadID: UUID?
+              var title = ""
+              var body = ""
+              var updatedAt = Date()
+          }
+
+          private struct CallEntry: Codable, Identifiable {
+              var id = UUID()
+              var leadID: UUID
+              var outcome: CallOutcome = .answered
+              var detail = ""
+              var date = Date()
+          }
+
+          private struct Records: Codable {
+              var leads: [Lead] = []
+              var reminders: [Reminder] = []
+              var notes: [Note] = []
+              var calls: [CallEntry] = []
+
+              func lead(_ id: UUID?) -> Lead? {
+                  guard let id else { return nil }
+                  return leads.first { $0.id == id }
+              }
+          }
+
+          private extension String {
+              var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+
+              func matches(_ query: String) -> Bool {
+                  query.isEmpty || localizedStandardContains(query)
+              }
+          }
+
+          // MARK: - Storage and notifications
+
+          @MainActor
+          private final class Store: ObservableObject {
+              @Published private(set) var records: Records
+              @Published private(set) var notificationWarning: String?
+              @Published private(set) var settingsAvailable = false
+              let loadWarning: String?
+
+              private let url: URL
+              private var notificationWork: Task<Void, Never>?
+
+              init() {
+                  let folder = URL.applicationSupportDirectory
+                      .appendingPathComponent("Perezvon", isDirectory: true)
+                  url = folder.appendingPathComponent("records.json")
+                  do {
+                      records = try JSONDecoder().decode(Records.self, from: Data(contentsOf: url))
+                      loadWarning = nil
+                  } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                      error.code == NSFileReadNoSuchFileError {
+                      records = Records()
+                      loadWarning = nil
+                  } catch {
+                      records = Records()
+                      loadWarning = "Не удалось открыть сохранённые данные. Перезапустите приложение, чтобы повторить попытку."
+                  }
+              }
+
+              func save(_ change: (inout Records) -> Void, requestNotifications: Bool = false) throws {
+                  guard loadWarning == nil else { throw StorageError.unavailable }
+                  var updated = records
+                  change(&updated)
+                  try FileManager.default.createDirectory(
+                      at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+                  )
+                  try JSONEncoder().encode(updated).write(to: url, options: [.atomic])
+                  let activeReminders = Dictionary(uniqueKeysWithValues: updated.reminders
+                      .filter { !$0.completed }
+                      .map { ($0.id, $0) })
+                  let removedAlerts = records.reminders.filter { original in
+                      guard !original.completed else { return false }
+                      guard let current = activeReminders[original.id] else { return true }
+                      return current.due != original.due || current.title != original.title ||
+                          current.leadID != original.leadID || current.kind != original.kind
+                  }.map { Self.notificationID($0.id) }
+                  records = updated
+                  if !removedAlerts.isEmpty {
+                      UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: removedAlerts)
+                  }
+                  syncNotifications(request: requestNotifications)
+              }
+
+              func syncNotifications(request: Bool = false) {
+                  guard loadWarning == nil else { return }
+                  let previous = notificationWork
+                  notificationWork = Task { [weak self] in
+                      await previous?.value
+                      await self?.updateNotifications(request: request)
+                  }
+              }
+
+              private func updateNotifications(request: Bool) async {
+                  let center = UNUserNotificationCenter.current()
+                  var status = await center.notificationSettings().authorizationStatus
+                  if request && status == .notDetermined {
+                      do {
+                          _ = try await center.requestAuthorization(options: [.alert, .sound])
+                          status = await center.notificationSettings().authorizationStatus
+                      } catch {
+                          notificationWarning = "Не удалось запросить разрешение на уведомления."
+                          settingsAvailable = false
+                          return
+                      }
+                  }
+
+                  let future = records.reminders
+                      .filter { !$0.completed && $0.due > Date() }
+                      .sorted { $0.due < $1.due }
+                  let allowed = status == .authorized || status == .provisional || status == .ephemeral
+                  settingsAvailable = status == .denied
+                  notificationWarning = !future.isEmpty && !allowed
+                      ? "Уведомления о напоминаниях выключены." : nil
+
+                  let pending = await center.pendingNotificationRequests()
+                  let existing = Dictionary(uniqueKeysWithValues: pending
+                      .filter { $0.identifier.hasPrefix("perezvon.") }
+                      .map { ($0.identifier, $0) })
+                  let wanted = allowed ? Set(future.map { Self.notificationID($0.id) }) : []
+                  let stale = existing.keys.filter { !wanted.contains($0) }
+                  if !stale.isEmpty {
+                      center.removePendingNotificationRequests(withIdentifiers: Array(stale))
+                  }
+                  guard allowed else { return }
+
+                  for reminder in future {
+                      let identifier = Self.notificationID(reminder.id)
+                      let leadName = records.lead(reminder.leadID)?.name
+                      let title = reminder.kind == .call ? "Пора позвонить" : "Напоминание"
+                      let body = [leadName, reminder.title].compactMap { $0 }.joined(separator: " · ")
+                      let stamp = reminder.due.timeIntervalSince1970
+                      if let old = existing[identifier]?.content,
+                         old.title == title, old.body == body,
+                         (old.userInfo["due"] as? NSNumber)?.doubleValue == stamp {
+                          continue
+                      }
+                      let delay = reminder.due.timeIntervalSinceNow
+                      guard delay > 0 else { continue }
+                      let content = UNMutableNotificationContent()
+                      content.title = title
+                      content.body = body
+                      content.sound = .default
+                      content.userInfo = ["reminderID": reminder.id.uuidString, "due": stamp]
+                      let trigger = UNTimeIntervalNotificationTrigger(timeInterval: delay, repeats: false)
+                      do {
+                          try await center.add(UNNotificationRequest(
+                              identifier: identifier, content: content, trigger: trigger
+                          ))
+                      } catch {
+                          notificationWarning = "Не удалось запланировать некоторые уведомления. Откройте приложение ещё раз, чтобы повторить попытку."
+                      }
+                  }
+              }
+
+              private static func notificationID(_ id: UUID) -> String {
+                  "perezvon." + id.uuidString
+              }
+          }
+
+          private enum StorageError: LocalizedError {
+              case unavailable
+              var errorDescription: String? { "Сохранённые данные сейчас недоступны." }
+          }
+
+          @MainActor
+          private final class ReminderLink: ObservableObject {
+              static let shared = ReminderLink()
+              @Published var id: UUID?
+          }
+
+          final class PerezvonDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+              func application(
+                  _ application: UIApplication,
+                  didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+              ) -> Bool {
+                  UNUserNotificationCenter.current().delegate = self
+                  return true
+              }
+
+              nonisolated func userNotificationCenter(
+                  _ center: UNUserNotificationCenter,
+                  willPresent notification: UNNotification
+              ) async -> UNNotificationPresentationOptions {
+                  [.banner, .list, .sound]
+              }
+
+              nonisolated func userNotificationCenter(
+                  _ center: UNUserNotificationCenter,
+                  didReceive response: UNNotificationResponse
+              ) async {
+                  guard let value = response.notification.request.content.userInfo["reminderID"] as? String,
+                        let id = UUID(uuidString: value) else { return }
+                  await MainActor.run { ReminderLink.shared.id = id }
+              }
+          }
+
+          // MARK: - App shell
+
+          private enum Palette {
+              static let paper = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+                  ? UIColor(red: 0.09, green: 0.11, blue: 0.09, alpha: 1)
+                  : UIColor(red: 0.98, green: 0.97, blue: 0.95, alpha: 1) })
+              static let ink = Color.primary
+              static let accent = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+                  ? UIColor(red: 0.69, green: 0.85, blue: 0.72, alpha: 1)
+                  : UIColor(red: 0.10, green: 0.27, blue: 0.21, alpha: 1) })
+              static let evergreen = Color(red: 0.10, green: 0.27, blue: 0.21)
+              static let sage = accent.opacity(0.14)
+              static let rule = Color.primary.opacity(0.14)
+              static let amber = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark
+                  ? UIColor(red: 1, green: 0.77, blue: 0.45, alpha: 1)
+                  : UIColor(red: 0.57, green: 0.28, blue: 0.04, alpha: 1) })
+          }
+
+          private enum Screen: String, CaseIterable, Identifiable {
+              case today = "Сегодня"
+              case leads = "Лиды"
+              case notes = "Заметки"
+
+              var id: Self { self }
+
+              var symbol: String {
+                  switch self {
+                  case .today: "calendar"
+                  case .leads: "person.2"
+                  case .notes: "note.text"
+                  }
+              }
+          }
+
+          private enum EditRoute: Identifiable {
+              case lead(Lead)
+              case reminder(Reminder)
+              case note(Note)
+              case call(CallEntry, completes: UUID?)
+
+              var id: String {
+                  switch self {
+                  case .lead(let value): "lead-\(value.id)"
+                  case .reminder(let value): "reminder-\(value.id)"
+                  case .note(let value): "note-\(value.id)"
+                  case .call(let value, _): "call-\(value.id)"
+                  }
+              }
+          }
+
+          private struct TimelineItem: Identifiable {
+              let id: UUID
+              let date: Date
+              let symbol: String
+              let title: String
+              let detail: String
+              let edit: EditRoute
+          }
+
+          @main
+          @MainActor
+          struct PerezvonApp: App {
+              @UIApplicationDelegateAdaptor(PerezvonDelegate.self) private var delegate
+              @StateObject private var store = Store()
+
+              var body: some Scene {
+                  WindowGroup {
+                      Dashboard()
+                          .environmentObject(store)
+                          .environment(\.locale, Locale(identifier: "ru_RU"))
+                          .tint(Palette.accent)
+                  }
+              }
+          }
+
+          @MainActor
+          private struct Dashboard: View {
+              @EnvironmentObject private var store: Store
+              @Environment(\.openURL) private var openURL
+              @Environment(\.scenePhase) private var scenePhase
+              @ObservedObject private var reminderLink = ReminderLink.shared
+
+              @State private var screen: Screen = .today
+              @State private var leadID: UUID?
+              @State private var editor: EditRoute?
+              @State private var alert: String?
+              @State private var deletingLead: Lead?
+              @State private var leadQuery = ""
+              @State private var noteQuery = ""
+
+              private var records: Records { store.records }
+              private var locale: Locale { Locale(identifier: "ru_RU") }
+
+              var body: some View {
+                  ScrollView {
+                      Group {
+                          if let warning = store.loadWarning {
+                              VStack(alignment: .leading, spacing: 16) {
+                                  heading("Перезвон")
+                                  Label(warning, systemImage: "exclamationmark.triangle")
+                                      .foregroundStyle(.secondary)
+                              }
+                          } else {
+                              content
+                          }
+                      }
+                      .frame(maxWidth: 580, alignment: .leading)
+                      .padding(.horizontal, 22)
+                      .padding(.top, 12)
+                      .padding(.bottom, 28)
+                      .frame(maxWidth: .infinity)
+                  }
+                  .id(scrollID)
+                  .scrollDismissesKeyboard(.interactively)
+                  .background(Palette.paper.ignoresSafeArea())
+                  .safeAreaInset(edge: .bottom, spacing: 0) { tabBar }
+                  .sheet(item: $editor) { route in
+                      switch route {
+                      case .lead(let draft): LeadEditor(draft: draft)
+                      case .reminder(let draft): ReminderEditor(draft: draft)
+                      case .note(let draft): NoteEditor(draft: draft)
+                      case .call(let draft, let reminderID): CallEditor(draft: draft, reminderID: reminderID)
+                      }
+                  }
+                  .alert("Перезвон", isPresented: Binding(
+                      get: { alert != nil }, set: { if !$0 { alert = nil } }
+                  )) {
+                      Button("ОК") { alert = nil }
+                  } message: {
+                      Text(alert ?? "")
+                  }
+                  .confirmationDialog(
+                      "Удалить лида?", isPresented: Binding(
+                          get: { deletingLead != nil }, set: { if !$0 { deletingLead = nil } }
+                      ), titleVisibility: .visible, presenting: deletingLead
+                  ) { lead in
+                      Button("Удалить лида", role: .destructive) { remove(lead) }
+                      Button("Отмена", role: .cancel) {}
+                  } message: { _ in
+                      Text("История звонков и напоминания будут удалены. Заметки сохранятся.")
+                  }
+                  .onChange(of: scenePhase, initial: true) { _, phase in
+                      if phase == .active { store.syncNotifications() }
+                  }
+                  .onChange(of: reminderLink.id, initial: true) { _, id in
+                      guard let id else { return }
+                      reminderLink.id = nil
+                      guard let reminder = records.reminders.first(where: { $0.id == id }) else { return }
+                      screen = .today
+                      editor = .reminder(reminder)
+                  }
+              }
+
+              private var scrollID: String {
+                  screen == .leads ? (leadID?.uuidString ?? screen.rawValue) : screen.rawValue
+              }
+
+              @ViewBuilder
+              private var content: some View {
+                  switch screen {
+                  case .today:
+                      TimelineView(.everyMinute) { context in today(at: context.date) }
+                  case .leads:
+                      if let lead = records.lead(leadID) { leadPage(lead) }
+                      else { leadsPage }
+                  case .notes:
+                      notesPage
+                  }
+              }
+
+              private var tabBar: some View {
+                  VStack(spacing: 0) {
+                      Divider()
+                      HStack(spacing: 0) {
+                          ForEach(Screen.allCases) { tab in
+                              Button {
+                                  if tab == .leads && screen == .leads { leadID = nil }
+                                  screen = tab
+                              } label: {
+                                  VStack(spacing: 4) {
+                                      Image(systemName: tab.symbol)
+                                          .font(.system(size: 20, weight: screen == tab ? .semibold : .regular))
+                                          .accessibilityHidden(true)
+                                      Text(tab.rawValue)
+                                          .font(.caption.weight(screen == tab ? .semibold : .regular))
+                                  }
+                                  .frame(maxWidth: .infinity)
+                                  .padding(.vertical, 9)
+                                  .contentShape(Rectangle())
+                                  .foregroundStyle(screen == tab ? Palette.accent : Color.secondary)
+                              }
+                              .buttonStyle(.plain)
+                              .accessibilityAddTraits(screen == tab ? .isSelected : [])
+                          }
+                      }
+                      .frame(maxWidth: 580)
+                  }
+                  .frame(maxWidth: .infinity)
+                  .background(Palette.paper.ignoresSafeArea(edges: .bottom))
+              }
+
+              private func today(at now: Date) -> some View {
+                  let pending = records.reminders.filter { !$0.completed }.sorted { $0.due < $1.due }
+                  let overdue = pending.filter { $0.due < now }
+                  let upcoming = pending.filter { $0.due >= now }
+                  let next = upcoming.first { $0.kind == .call }
+                  let schedule = upcoming.filter { $0.id != next?.id }
+                  let completed = records.reminders.filter {
+                      $0.completed && Calendar.current.isDate($0.due, inSameDayAs: now)
+                  }.sorted { $0.due < $1.due }
+
+                  return VStack(alignment: .leading, spacing: 22) {
+                      VStack(alignment: .leading, spacing: 3) {
+                          header("Сегодня", addLabel: "Добавить напоминание") {
+                              makeReminder()
+                          }
+                          Text(now.formatted(.dateTime.weekday(.wide).day().month(.wide).locale(locale)).capitalizedFirst)
+                              .font(.title3)
+                              .foregroundStyle(.secondary)
+                      }
+
+                      if let warning = store.notificationWarning {
+                          VStack(alignment: .leading, spacing: 8) {
+                              Label(warning, systemImage: "bell.slash")
+                                  .font(.footnote)
+                              Button(store.settingsAvailable ? "Открыть настройки" : "Включить уведомления") {
+                                  if store.settingsAvailable,
+                                     let url = URL(string: UIApplication.openSettingsURLString) {
+                                      openURL(url)
+                                  } else {
+                                      store.syncNotifications(request: true)
+                                  }
+                              }
+                              .font(.footnote.weight(.semibold))
+                          }
+                          .foregroundStyle(Palette.accent)
+                      }
+
+                      if let next { nextCall(next, now: now) }
+
+                      if !schedule.isEmpty {
+                          reminderSection("Дальше", items: schedule, now: now)
+                      }
+
+                      if !overdue.isEmpty {
+                          VStack(alignment: .leading, spacing: 8) {
+                              Label("Просрочено", systemImage: "clock")
+                                  .font(.headline)
+                                  .foregroundStyle(Palette.amber)
+                              ForEach(overdue) { reminder in reminderRow(reminder, now: now) }
+                          }
+                          .padding(12)
+                          .frame(maxWidth: .infinity, alignment: .leading)
+                          .background(Palette.amber.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+                      }
+
+                      if pending.isEmpty {
+                          empty("Напоминаний пока нет", detail: "Запланируйте звонок или другое дело.", icon: "bell")
+                      }
+
+                      if !completed.isEmpty {
+                          reminderSection("Выполнено", items: completed, now: now)
+                      }
+                  }
+              }
+
+              private func nextCall(_ reminder: Reminder, now: Date) -> some View {
+                  let lead = records.lead(reminder.leadID)
+                  return VStack(alignment: .leading, spacing: 8) {
+                      HStack(alignment: .top) {
+                          Text("СЛЕДУЮЩИЙ ЗВОНОК")
+                              .font(.caption.weight(.semibold))
+                              .tracking(1.25)
+                              .foregroundStyle(.white.opacity(0.80))
+                          Spacer()
+                          Menu {
+                              Button("Изменить", systemImage: "pencil") { editor = .reminder(reminder) }
+                              Button("Выполнено", systemImage: "checkmark.circle") { toggle(reminder) }
+                              if let lead {
+                                  Button("Записать итог", systemImage: "square.and.pencil") { editor = .call(CallEntry(leadID: lead.id), completes: reminder.id) }
+                              }
+                          } label: {
+                              Image(systemName: "ellipsis")
+                                  .font(.system(size: 19, weight: .semibold))
+                                  .frame(minWidth: 44, minHeight: 32)
+                                  .contentShape(Rectangle())
+                                  .accessibilityLabel("Действия со звонком")
+                          }
+                      }
+
+                      Text(reminderTime(reminder.due, relativeTo: now))
+                          .font(.system(.largeTitle, design: .default).weight(.bold))
+                          .monospacedDigit()
+                      if let lead {
+                          Text(lead.name).font(.title3.weight(.semibold))
+                      }
+                      Text(reminder.title)
+                          .foregroundStyle(.white.opacity(0.85))
+
+                      if let lead, lead.dialURL != nil {
+                          Button { dial(lead) } label: {
+                              Label("Позвонить", systemImage: "phone.fill")
+                                  .font(.subheadline.weight(.semibold))
+                                  .padding(.horizontal, 15)
+                                  .frame(minHeight: 44)
+                                  .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(0.65)))
+                          }
+                          .buttonStyle(.plain)
+                          .padding(.top, 4)
+                      } else {
+                          Text("Для звонка нужен лид с номером телефона.")
+                              .font(.footnote)
+                              .foregroundStyle(.white.opacity(0.85))
+                              .padding(.top, 4)
+                      }
+                  }
+                  .foregroundStyle(.white)
+                  .padding(20)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .background(Palette.evergreen, in: RoundedRectangle(cornerRadius: 18))
+              }
+
+              private func reminderSection(_ title: String, items: [Reminder], now: Date) -> some View {
+                  VStack(alignment: .leading, spacing: 0) {
+                      section(title).padding(.bottom, 8)
+                      ForEach(items) { reminder in
+                          reminderRow(reminder, now: now)
+                          Divider()
+                      }
+                  }
+              }
+
+              private func reminderRow(_ reminder: Reminder, now: Date) -> some View {
+                  HStack(spacing: 7) {
+                      Button { toggle(reminder) } label: {
+                          Image(systemName: reminder.completed ? "checkmark.circle.fill" : "circle")
+                              .font(.title3)
+                              .foregroundStyle(reminder.completed ? Palette.accent : Color.secondary)
+                              .frame(width: 44, height: 44)
+                              .contentShape(Rectangle())
+                      }
+                      .buttonStyle(.plain)
+                      .accessibilityLabel(reminder.completed ? "Вернуть в работу" : "Отметить выполненным")
+
+                      Button { editor = .reminder(reminder) } label: {
+                          HStack(spacing: 12) {
+                              VStack(alignment: .leading, spacing: 3) {
+                                  Text(reminderTime(reminder.due, relativeTo: now))
+                                      .font(.headline.monospacedDigit())
+                                  if let lead = records.lead(reminder.leadID) {
+                                      Text(lead.name).font(.subheadline.weight(.semibold))
+                                  }
+                                  Text(reminder.title)
+                                      .font(.subheadline)
+                                      .foregroundStyle(.secondary)
+                              }
+                              Spacer(minLength: 0)
+                              Image(systemName: "chevron.right")
+                                  .font(.caption.weight(.semibold))
+                                  .foregroundStyle(.secondary)
+                          }
+                          .frame(maxWidth: .infinity, alignment: .leading)
+                          .padding(.vertical, 11)
+                          .contentShape(Rectangle())
+                      }
+                      .buttonStyle(.plain)
+                  }
+              }
+
+              private var leadsPage: some View {
+                  let query = leadQuery.trimmed
+                  let leads = records.leads
+                      .filter { $0.name.matches(query) || $0.contact.matches(query) || $0.phone.matches(query) }
+                      .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+                  return VStack(alignment: .leading, spacing: 20) {
+                      header("Лиды", addLabel: "Добавить лида") { editor = .lead(Lead()) }
+
+                      if !records.leads.isEmpty {
+                          searchField("Поиск лидов", text: $leadQuery)
+                      }
+
+                      if leads.isEmpty {
+                          if query.isEmpty {
+                              empty("Лидов пока нет", detail: "Добавьте компанию и контакт для первого звонка.", icon: "person.2")
+                          } else {
+                              empty("Ничего не найдено", detail: "Попробуйте другое имя или номер.", icon: "magnifyingglass")
+                          }
+                      } else {
+                          LazyVStack(spacing: 0) {
+                              ForEach(leads) { lead in
+                                  Button { leadID = lead.id } label: {
+                                      HStack(spacing: 13) {
+                                          Image(systemName: "person.crop.circle")
+                                              .font(.title2)
+                                              .foregroundStyle(Palette.accent)
+                                              .accessibilityHidden(true)
+                                          VStack(alignment: .leading, spacing: 4) {
+                                              Text(lead.name).font(.headline)
+                                              if !lead.contact.isEmpty {
+                                                  Text(lead.contact).font(.subheadline).foregroundStyle(.secondary)
+                                              }
+                                              Text(lead.stage.title)
+                                                  .font(.caption.weight(.medium))
+                                                  .foregroundStyle(Palette.accent)
+                                          }
+                                          Spacer(minLength: 0)
+                                          chevron
+                                      }
+                                      .padding(.vertical, 14)
+                                      .contentShape(Rectangle())
+                                  }
+                                  .buttonStyle(.plain)
+                                  Divider()
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private func leadPage(_ lead: Lead) -> some View {
+                  let history = timeline(for: lead)
+                  return VStack(alignment: .leading, spacing: 22) {
+                      HStack {
+                          Button {
+                              leadID = nil
+                          } label: {
+                              Label("Лиды", systemImage: "chevron.left")
+                                  .font(.body.weight(.semibold))
+                                  .frame(minHeight: 44)
+                          }
+                          .buttonStyle(.plain)
+                          .foregroundStyle(Palette.accent)
+                          Spacer()
+                          Menu {
+                              Button("Изменить", systemImage: "pencil") { editor = .lead(lead) }
+                              Button("Добавить заметку", systemImage: "note.text") { editor = .note(Note(leadID: lead.id)) }
+                              Button("Удалить лида", systemImage: "trash", role: .destructive) { deletingLead = lead }
+                          } label: {
+                              Image(systemName: "ellipsis")
+                                  .font(.title3.weight(.semibold))
+                                  .frame(width: 44, height: 44)
+                                  .contentShape(Rectangle())
+                                  .accessibilityLabel("Действия с лидом")
+                          }
+                      }
+
+                      VStack(alignment: .leading, spacing: 12) {
+                          heading(lead.name)
+                          Text(lead.stage.title)
+                              .font(.subheadline.weight(.semibold))
+                              .foregroundStyle(Palette.accent)
+                              .padding(.horizontal, 11)
+                              .padding(.vertical, 5)
+                              .background(Palette.sage, in: RoundedRectangle(cornerRadius: 8))
+                          if !lead.contact.isEmpty { Text(lead.contact).font(.title3) }
+                          if !lead.phone.isEmpty { Text(lead.phone).foregroundStyle(.secondary) }
+                      }
+
+                      ViewThatFits(in: .horizontal) {
+                          HStack(spacing: 10) { leadActions(lead) }
+                          VStack(spacing: 10) { leadActions(lead) }
+                      }
+
+                      VStack(alignment: .leading, spacing: 0) {
+                          section("История").padding(.bottom, 9)
+                          if history.isEmpty {
+                              Text("Здесь будут звонки, заметки и напоминания.")
+                                  .font(.subheadline)
+                                  .foregroundStyle(.secondary)
+                                  .padding(.vertical, 12)
+                          } else {
+                              ForEach(history) { item in
+                                  Divider()
+                                  Button { editor = item.edit } label: {
+                                      HStack(alignment: .top, spacing: 12) {
+                                          Image(systemName: item.symbol)
+                                              .foregroundStyle(Palette.accent)
+                                              .frame(width: 22)
+                                              .padding(.top, 3)
+                                              .accessibilityHidden(true)
+                                          VStack(alignment: .leading, spacing: 5) {
+                                              Text(item.date.formatted(.dateTime.day().month(.wide).hour().minute().locale(locale)))
+                                                  .font(.caption.weight(.semibold))
+                                                  .foregroundStyle(.secondary)
+                                              Text(item.title).font(.headline)
+                                              if !item.detail.isEmpty {
+                                                  Text(item.detail).font(.subheadline).foregroundStyle(.secondary)
+                                              }
+                                          }
+                                          Spacer(minLength: 0)
+                                          chevron.padding(.top, 5)
+                                      }
+                                      .padding(.vertical, 13)
+                                      .contentShape(Rectangle())
+                                  }
+                                  .buttonStyle(.plain)
+                              }
+                              Divider()
+                          }
+
+                          Button {
+                              editor = .call(CallEntry(leadID: lead.id), completes: nil)
+                          } label: {
+                              Label("Добавить запись", systemImage: "plus")
+                                  .font(.body.weight(.medium))
+                                  .frame(minHeight: 48)
+                          }
+                          .buttonStyle(.plain)
+                          .foregroundStyle(Palette.accent)
+                      }
+                  }
+              }
+
+              @ViewBuilder
+              private func leadActions(_ lead: Lead) -> some View {
+                  Button {
+                      if lead.dialURL != nil { dial(lead) }
+                      else { editor = .lead(lead) }
+                  } label: {
+                      actionLabel(lead.dialURL == nil ? "Добавить номер" : "Позвонить", icon: "phone.fill", primary: true)
+                  }
+                  .buttonStyle(.plain)
+                  Button {
+                      makeReminder(leadID: lead.id)
+                  } label: {
+                      actionLabel("Напомнить", icon: "bell", primary: false)
+                  }
+                  .buttonStyle(.plain)
+              }
+
+              private var notesPage: some View {
+                  let query = noteQuery.trimmed
+                  let notes = records.notes
+                      .filter {
+                          $0.title.matches(query) || $0.body.matches(query) ||
+                              (records.lead($0.leadID)?.name.matches(query) ?? false)
+                      }
+                      .sorted { $0.updatedAt > $1.updatedAt }
+
+                  return VStack(alignment: .leading, spacing: 20) {
+                      header("Заметки", addLabel: "Добавить заметку") { editor = .note(Note()) }
+
+                      if !records.notes.isEmpty {
+                          searchField("Поиск заметок", text: $noteQuery)
+                      }
+
+                      if notes.isEmpty {
+                          if query.isEmpty {
+                              empty("Заметок пока нет", detail: "Сохраните скрипт звонка или детали разговора.", icon: "note.text")
+                          } else {
+                              empty("Ничего не найдено", detail: "Попробуйте другой запрос.", icon: "magnifyingglass")
+                          }
+                      } else {
+                          LazyVStack(alignment: .leading, spacing: 0) {
+                              section(query.isEmpty ? "Недавние" : "Результаты").padding(.bottom, 8)
+                              ForEach(notes) { note in
+                                  Button { editor = .note(note) } label: {
+                                      HStack(alignment: .top, spacing: 13) {
+                                          Image(systemName: "doc.text")
+                                              .foregroundStyle(.secondary)
+                                              .frame(width: 24)
+                                              .padding(.top, 3)
+                                              .accessibilityHidden(true)
+                                          VStack(alignment: .leading, spacing: 5) {
+                                              Text(note.title).font(.headline)
+                                              if !note.body.isEmpty {
+                                                  Text(note.body).font(.subheadline).lineLimit(2)
+                                              }
+                                              if let lead = records.lead(note.leadID) {
+                                                  Text(lead.name).font(.caption).foregroundStyle(.secondary)
+                                              }
+                                          }
+                                          Spacer(minLength: 0)
+                                          chevron.padding(.top, 5)
+                                      }
+                                      .padding(.vertical, 14)
+                                      .contentShape(Rectangle())
+                                  }
+                                  .buttonStyle(.plain)
+                                  Divider()
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private func timeline(for lead: Lead) -> [TimelineItem] {
+                  let reminders = records.reminders.filter { $0.leadID == lead.id }.map {
+                      TimelineItem(
+                          id: $0.id, date: $0.due, symbol: $0.completed ? "checkmark.circle" : $0.kind.symbol,
+                          title: $0.title, detail: $0.completed ? "Выполнено" : $0.kind.title,
+                          edit: .reminder($0)
+                      )
+                  }
+                  let calls = records.calls.filter { $0.leadID == lead.id }.map {
+                      TimelineItem(
+                          id: $0.id, date: $0.date, symbol: "phone", title: $0.outcome.title,
+                          detail: $0.detail, edit: .call($0, completes: nil)
+                      )
+                  }
+                  let notes = records.notes.filter { $0.leadID == lead.id }.map {
+                      TimelineItem(
+                          id: $0.id, date: $0.updatedAt, symbol: "note.text", title: $0.title,
+                          detail: $0.body, edit: .note($0)
+                      )
+                  }
+                  return (reminders + calls + notes).sorted { $0.date > $1.date }
+              }
+
+              private func makeReminder(leadID: UUID? = nil) {
+                  let kind: ReminderKind = leadID == nil ? .task : .call
+                  editor = .reminder(Reminder(leadID: leadID, kind: kind))
+              }
+
+              private func dial(_ lead: Lead) {
+                  guard let url = lead.dialURL else { return }
+                  openURL(url) { accepted in
+                      if !accepted {
+                          Task { @MainActor in alert = "Устройство не смогло открыть звонок." }
+                      }
+                  }
+              }
+
+              private func toggle(_ reminder: Reminder) {
+                  do {
+                      try store.save({ records in
+                          guard let index = records.reminders.firstIndex(where: { $0.id == reminder.id }) else { return }
+                          records.reminders[index].completed.toggle()
+                      }, requestNotifications: reminder.completed && reminder.due > Date())
+                  } catch {
+                      alert = "Не удалось обновить напоминание. Попробуйте ещё раз."
+                  }
+              }
+
+              private func remove(_ lead: Lead) {
+                  do {
+                      try store.save { records in
+                          records.leads.removeAll { $0.id == lead.id }
+                          records.reminders.removeAll { $0.leadID == lead.id }
+                          records.calls.removeAll { $0.leadID == lead.id }
+                          for index in records.notes.indices where records.notes[index].leadID == lead.id {
+                              records.notes[index].leadID = nil
+                          }
+                      }
+                      leadID = nil
+                  } catch {
+                      alert = "Не удалось удалить лида. Попробуйте ещё раз."
+                  }
+                  deletingLead = nil
+              }
+
+              private func reminderTime(_ date: Date, relativeTo now: Date) -> String {
+                  let time = date.formatted(.dateTime.hour().minute().locale(locale))
+                  if Calendar.current.isDate(date, inSameDayAs: now) { return time }
+                  return date.formatted(.dateTime.day().month(.abbreviated).locale(locale)) + ", " + time
+              }
+
+              private func header(_ title: String, addLabel: String, action: @escaping () -> Void) -> some View {
+                  HStack(alignment: .center) {
+                      heading(title)
+                      Spacer(minLength: 10)
+                      Button(action: action) {
+                          Image(systemName: "plus")
+                              .font(.system(size: 21, weight: .medium))
+                              .frame(width: 44, height: 44)
+                              .foregroundStyle(Palette.accent)
+                              .background(Palette.sage, in: Circle())
+                      }
+                      .buttonStyle(.plain)
+                      .accessibilityLabel(addLabel)
+                  }
+              }
+
+              private func heading(_ title: String) -> some View {
+                  Text(title)
+                      .font(.largeTitle.weight(.bold))
+                      .tracking(-0.8)
+                      .foregroundStyle(Palette.ink)
+                      .accessibilityAddTraits(.isHeader)
+              }
+
+              private func section(_ title: String) -> some View {
+                  Text(title)
+                      .font(.title2.weight(.bold))
+                      .accessibilityAddTraits(.isHeader)
+              }
+
+              private var chevron: some View {
+                  Image(systemName: "chevron.right")
+                      .font(.caption.weight(.semibold))
+                      .foregroundStyle(.secondary)
+                      .accessibilityHidden(true)
+              }
+
+              private func searchField(_ prompt: String, text: Binding<String>) -> some View {
+                  HStack(spacing: 10) {
+                      Image(systemName: "magnifyingglass")
+                          .foregroundStyle(.secondary)
+                          .accessibilityHidden(true)
+                      TextField(prompt, text: text)
+                          .submitLabel(.search)
+                          .autocorrectionDisabled()
+                      if !text.wrappedValue.isEmpty {
+                          Button { text.wrappedValue = "" } label: {
+                              Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                          }
+                          .buttonStyle(.plain)
+                          .accessibilityLabel("Очистить поиск")
+                      }
+                  }
+                  .padding(.horizontal, 13)
+                  .frame(minHeight: 46)
+                  .background(Palette.rule.opacity(0.52), in: RoundedRectangle(cornerRadius: 11))
+              }
+
+              private func empty(_ title: String, detail: String, icon: String) -> some View {
+                  VStack(alignment: .leading, spacing: 7) {
+                      Label(title, systemImage: icon)
+                          .font(.headline)
+                      Text(detail).font(.subheadline).foregroundStyle(.secondary)
+                  }
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                  .padding(.vertical, 18)
+              }
+
+              private func actionLabel(_ title: String, icon: String, primary: Bool) -> some View {
+                  Label(title, systemImage: icon)
+                      .font(.subheadline.weight(.semibold))
+                      .fixedSize(horizontal: true, vertical: false)
+                      .padding(.horizontal, 11)
+                      .frame(maxWidth: .infinity, minHeight: 48)
+                      .foregroundStyle(primary ? Color.white : Palette.accent)
+                      .background(primary ? Palette.evergreen : Palette.sage, in: RoundedRectangle(cornerRadius: 12))
+              }
+          }
+
+          private extension String {
+              var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
+          }
+
+          // MARK: - Editors
+
+          @MainActor
+          private struct EditSheet<Fields: View>: View {
+              @Environment(\.dismiss) private var dismiss
+              @State private var error: String?
+
+              let title: String
+              let canSave: Bool
+              let save: () throws -> Void
+              let fields: () -> Fields
+
+              init(title: String, canSave: Bool, save: @escaping () throws -> Void,
+                   @ViewBuilder fields: @escaping () -> Fields) {
+                  self.title = title
+                  self.canSave = canSave
+                  self.save = save
+                  self.fields = fields
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          fields()
+                          if let error {
+                              Text(error)
+                                  .font(.footnote)
+                                  .foregroundStyle(Palette.amber)
+                          }
+                      }
+                      .scrollContentBackground(.hidden)
+                      .background(Palette.paper.ignoresSafeArea())
+                      .navigationTitle(title)
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .cancellationAction) {
+                              Button("Отмена") { dismiss() }
+                          }
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Сохранить") {
+                                  do {
+                                      try save()
+                                      dismiss()
+                                  } catch {
+                                      self.error = "Не удалось сохранить изменения. Проверьте доступное место и попробуйте ещё раз."
+                                  }
+                              }
+                              .fontWeight(.semibold)
+                              .disabled(!canSave)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @MainActor
+          private struct LeadPicker: View {
+              @EnvironmentObject private var store: Store
+              @Binding var selection: UUID?
+
+              var body: some View {
+                  Picker("Лид", selection: $selection) {
+                      Text("Без привязки").tag(nil as UUID?)
+                      ForEach(store.records.leads.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
+                          Text($0.name).tag($0.id as UUID?)
+                      }
+                  }
+              }
+          }
+
+          @MainActor
+          private struct LeadEditor: View {
+              @EnvironmentObject private var store: Store
+              @State var draft: Lead
+
+              init(draft: Lead) {
+                  _draft = State(initialValue: draft)
+              }
+
+              private var exists: Bool { store.records.leads.contains { $0.id == draft.id } }
+
+              private var validPhone: Bool {
+                  draft.phone.trimmed.isEmpty || draft.dialURL != nil
+              }
+
+              var body: some View {
+                  EditSheet(title: exists ? "Изменить лида" : "Новый лид",
+                            canSave: !draft.name.trimmed.isEmpty && validPhone,
+                            save: save) {
+                      Section("Контакт") {
+                          TextField("Компания или имя", text: $draft.name)
+                              .textContentType(.organizationName)
+                          TextField("Имя и должность контакта", text: $draft.contact)
+                          TextField("Номер телефона", text: $draft.phone)
+                              .textContentType(.telephoneNumber)
+                              .keyboardType(.phonePad)
+                      }
+                      if !validPhone {
+                          Text("Проверьте номер телефона.")
+                              .font(.footnote)
+                              .foregroundStyle(Palette.amber)
+                      }
+                      Section("Статус") {
+                          Picker("Статус лида", selection: $draft.stage) {
+                              ForEach(LeadStage.allCases) { Text($0.title).tag($0) }
+                          }
+                      }
+                  }
+              }
+
+              private func save() throws {
+                  var lead = draft
+                  lead.name = lead.name.trimmed
+                  lead.contact = lead.contact.trimmed
+                  lead.phone = lead.phone.trimmed
+                  try store.save { $0.leads.upsert(lead) }
+              }
+          }
+
+          @MainActor
+          private struct ReminderEditor: View {
+              @EnvironmentObject private var store: Store
+              @Environment(\.dismiss) private var dismiss
+              @Environment(\.openURL) private var openURL
+              @State var draft: Reminder
+              @State private var confirmDelete = false
+              @State private var actionError: String?
+
+              init(draft: Reminder) {
+                  _draft = State(initialValue: draft)
+              }
+
+              private var exists: Bool { store.records.reminders.contains { $0.id == draft.id } }
+
+              var body: some View {
+                  EditSheet(title: exists ? "Напоминание" : "Новое напоминание",
+                            canSave: !draft.title.trimmed.isEmpty, save: save) {
+                      Section("Что сделать") {
+                          TextField("Например, уточнить по охране", text: $draft.title)
+                          Picker("Тип", selection: $draft.kind) {
+                              ForEach(ReminderKind.allCases) { Text($0.title).tag($0) }
+                          }
+                          LeadPicker(selection: $draft.leadID)
+                      }
+                      Section("Когда") {
+                          DatePicker("Дата и время", selection: $draft.due, displayedComponents: [.date, .hourAndMinute])
+                          if exists { Toggle("Выполнено", isOn: $draft.completed) }
+                      }
+                      if exists, draft.kind == .call, let url = store.records.lead(draft.leadID)?.dialURL {
+                          Section {
+                              Button("Позвонить", systemImage: "phone.fill") {
+                                  openURL(url) { accepted in
+                                      if !accepted {
+                                          Task { @MainActor in actionError = "Устройство не смогло открыть звонок." }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      if exists {
+                          Section {
+                              Button("Удалить напоминание", role: .destructive) { confirmDelete = true }
+                          }
+                          .confirmationDialog("Удалить напоминание?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                              Button("Удалить", role: .destructive, action: remove)
+                              Button("Отмена", role: .cancel) {}
+                          }
+                      }
+                      if let actionError { Text(actionError).font(.footnote).foregroundStyle(Palette.amber) }
+                  }
+              }
+
+              private func save() throws {
+                  var reminder = draft
+                  reminder.title = reminder.title.trimmed
+                  reminder.due = reminder.due.minuteStart
+                  try store.save({ $0.reminders.upsert(reminder) },
+                                 requestNotifications: !reminder.completed && reminder.due > Date())
+              }
+
+              private func remove() {
+                  do {
+                      try store.save { $0.reminders.removeAll { $0.id == draft.id } }
+                      dismiss()
+                  } catch {
+                      actionError = "Не удалось удалить напоминание."
+                  }
+              }
+          }
+
+          @MainActor
+          private struct NoteEditor: View {
+              @EnvironmentObject private var store: Store
+              @Environment(\.dismiss) private var dismiss
+              @State var draft: Note
+              @State private var confirmDelete = false
+              @State private var actionError: String?
+
+              init(draft: Note) {
+                  _draft = State(initialValue: draft)
+              }
+
+              private var exists: Bool { store.records.notes.contains { $0.id == draft.id } }
+
+              var body: some View {
+                  EditSheet(title: exists ? "Заметка" : "Новая заметка",
+                            canSave: !draft.title.trimmed.isEmpty, save: save) {
+                      Section {
+                          TextField("Название", text: $draft.title)
+                              .font(.headline)
+                          TextEditor(text: $draft.body)
+                              .frame(minHeight: 150)
+                              .accessibilityLabel("Текст заметки")
+                      }
+                      Section {
+                          LeadPicker(selection: $draft.leadID)
+                      }
+                      if exists {
+                          Section {
+                              Button("Удалить заметку", role: .destructive) { confirmDelete = true }
+                          }
+                          .confirmationDialog("Удалить заметку?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                              Button("Удалить", role: .destructive, action: remove)
+                              Button("Отмена", role: .cancel) {}
+                          }
+                      }
+                      if let actionError { Text(actionError).font(.footnote).foregroundStyle(Palette.amber) }
+                  }
+              }
+
+              private func save() throws {
+                  var note = draft
+                  note.title = note.title.trimmed
+                  note.body = note.body.trimmed
+                  note.updatedAt = Date()
+                  try store.save { $0.notes.upsert(note) }
+              }
+
+              private func remove() {
+                  do {
+                      try store.save { $0.notes.removeAll { $0.id == draft.id } }
+                      dismiss()
+                  } catch {
+                      actionError = "Не удалось удалить заметку."
+                  }
+              }
+          }
+
+          @MainActor
+          private struct CallEditor: View {
+              @EnvironmentObject private var store: Store
+              @Environment(\.dismiss) private var dismiss
+              @State var draft: CallEntry
+              let reminderID: UUID?
+              @State private var finishReminder = true
+              @State private var scheduleCallback = false
+              @State private var callbackDate = Date().addingTimeInterval(86_400)
+              @State private var confirmDelete = false
+              @State private var actionError: String?
+
+              init(draft: CallEntry, reminderID: UUID?) {
+                  _draft = State(initialValue: draft)
+                  self.reminderID = reminderID
+              }
+
+              private var exists: Bool { store.records.calls.contains { $0.id == draft.id } }
+
+              var body: some View {
+                  let validCallback = !scheduleCallback || callbackDate.minuteStart > Date()
+                  return EditSheet(title: "Итог звонка",
+                                   canSave: store.records.lead(draft.leadID) != nil && validCallback, save: save) {
+                      Section("Разговор") {
+                          if let lead = store.records.lead(draft.leadID) { Text(lead.name).font(.headline) }
+                          Picker("Итог", selection: $draft.outcome) {
+                              ForEach(CallOutcome.allCases) { Text($0.title).tag($0) }
+                          }
+                          TextField("О чём договорились", text: $draft.detail, axis: .vertical)
+                              .lineLimit(3...8)
+                          DatePicker("Дата и время звонка", selection: $draft.date, displayedComponents: [.date, .hourAndMinute])
+                      }
+                      if !exists {
+                          Section("Следующий шаг") {
+                              if reminderID != nil { Toggle("Отметить звонок выполненным", isOn: $finishReminder) }
+                              Toggle("Напомнить перезвонить", isOn: $scheduleCallback)
+                              if scheduleCallback {
+                                  DatePicker("Дата и время", selection: $callbackDate,
+                                             in: Date().minuteStart.addingTimeInterval(60)...,
+                                             displayedComponents: [.date, .hourAndMinute])
+                                  if !validCallback {
+                                      Text("Выберите время позже текущего.")
+                                          .font(.footnote)
+                                          .foregroundStyle(Palette.amber)
+                                  }
+                              }
+                          }
+                      } else {
+                          Section {
+                              Button("Удалить запись", role: .destructive) { confirmDelete = true }
+                          }
+                          .confirmationDialog("Удалить запись о звонке?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                              Button("Удалить", role: .destructive, action: remove)
+                              Button("Отмена", role: .cancel) {}
+                          }
+                      }
+
+                      if let actionError { Text(actionError).font(.footnote).foregroundStyle(Palette.amber) }
+                  }
+              }
+
+              private func save() throws {
+                  var call = draft
+                  call.detail = call.detail.trimmed
+                  let callback = scheduleCallback && !exists
+                  try store.save({ records in
+                      records.calls.upsert(call)
+                      if finishReminder, let reminderID,
+                         let index = records.reminders.firstIndex(where: { $0.id == reminderID }) {
+                          records.reminders[index].completed = true
+                      }
+                      if callback {
+                          records.reminders.append(Reminder(
+                              leadID: call.leadID, title: "Перезвонить", kind: .call,
+                              due: callbackDate.minuteStart
+                          ))
+                      }
+                  }, requestNotifications: callback)
+              }
+
+              private func remove() {
+                  do {
+                      try store.save { $0.calls.removeAll { $0.id == draft.id } }
+                      dismiss()
+                  } catch {
+                      actionError = "Не удалось удалить запись о звонке."
+                  }
+              }
+          }
+
+          private extension Date {
+              var minuteStart: Date { Calendar.current.dateInterval(of: .minute, for: self)?.start ?? self }
+          }
+
+          private extension Array where Element: Identifiable {
+              mutating func upsert(_ item: Element) {
+                  if let index = firstIndex(where: { $0.id == item.id }) {
+                      self[index] = item
+                  } else {
+                      append(item)
+                  }
+              }
+          }
+          PEREZVON_SWIFT
+
+          python3 <<'PROJECT_PY'
+          import json
+          import os
+          import struct
+          import zlib
+          from pathlib import Path
+
+          assets = Path("Perezvon/Assets.xcassets")
+          app_icon = assets / "AppIcon.appiconset"
+          app_icon.mkdir(parents=True)
+          info = {"author": "xcode", "version": 1}
+          (assets / "Contents.json").write_text(json.dumps({"info": info}), encoding="utf-8")
+          (app_icon / "Contents.json").write_text(json.dumps({
+              "images": [{"filename": "AppIcon.png", "idiom": "universal", "platform": "ios", "size": "1024x1024"}],
+              "info": info,
+          }), encoding="utf-8")
+
+          def chunk(kind, data):
+              return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+          size = 1024
+          pixels = bytearray()
+          background = bytes((26, 69, 54))
+          foreground = bytes((244, 242, 222))
+          for y in range(size):
+              pixels.append(0)
+              for x in range(size):
+                  dx, dy = x - 512, y - 512
+                  radius_squared = dx * dx + dy * dy
+                  ring = 253**2 <= radius_squared <= 296**2
+                  hand_up = abs(dx) <= 18 and -175 <= dy <= 10
+                  hand_right = 0 <= dx <= 151 and abs(dy) <= 18
+                  pixels.extend(foreground if ring or hand_up or hand_right else background)
+          (app_icon / "AppIcon.png").write_bytes(
+              b"\x89PNG\r\n\x1a\n"
+              + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+              + chunk(b"IDAT", zlib.compress(pixels))
+              + chunk(b"IEND", b"")
+          )
+
+          spec = {
+              "name": "Perezvon",
+              "options": {"deploymentTarget": {"iOS": "17.0"}},
+              "targets": {
+                  "Perezvon": {
+                      "type": "application",
+                      "platform": "iOS",
+                      "sources": ["Perezvon"],
+                      "settings": {"base": {
+                          "PRODUCT_BUNDLE_IDENTIFIER": os.environ.get("PEREZVON_BUNDLE_ID", "app.perezvon.ios"),
+                          "GENERATE_INFOPLIST_FILE": "YES",
+                          "INFOPLIST_KEY_CFBundleDisplayName": "Перезвон",
+                          "INFOPLIST_KEY_UIApplicationSceneManifest_Generation": "YES",
+                          "INFOPLIST_KEY_UILaunchScreen_Generation": "YES",
+                          "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
+                          "SWIFT_VERSION": "5.0",
+                          "TARGETED_DEVICE_FAMILY": "1",
+                          "MARKETING_VERSION": "1.0",
+                          "CURRENT_PROJECT_VERSION": os.environ.get("GITHUB_RUN_NUMBER", "1"),
+                          "SUPPORTS_MACCATALYST": "NO",
+                          "SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD": "NO",
+                          "SKIP_INSTALL": "NO",
+                      }},
+                  },
+              },
+              "schemes": {"Perezvon": {
+                  "build": {"targets": {"Perezvon": "all"}},
+                  "archive": {"config": "Release"},
+              }},
+          }
+          Path("project.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+          PROJECT_PY
+
+          xcodegen generate --spec project.json
+          xcode_args=(
+            -project Perezvon.xcodeproj
+            -scheme Perezvon
+            -configuration Release
+            -sdk iphoneos
+            -destination "generic/platform=iOS"
+            -derivedDataPath "$project_dir/DerivedData"
+          )
+
+          if [[ -n "${PEREZVON_PROFILE_ID:-}" ]]; then
+            xcodebuild "${xcode_args[@]}" \
+              -archivePath "$project_dir/Perezvon.xcarchive" \
+              CODE_SIGN_STYLE=Manual \
+              DEVELOPMENT_TEAM="$PEREZVON_TEAM_ID" \
+              CODE_SIGN_IDENTITY="$PEREZVON_CERT_ID" \
+              PROVISIONING_PROFILE_SPECIFIER="$PEREZVON_PROFILE_ID" archive
+
+            xcodebuild -exportArchive \
+              -archivePath "$project_dir/Perezvon.xcarchive" \
+              -exportPath "$project_dir/export" \
+              -exportOptionsPlist "$PEREZVON_EXPORT_OPTIONS"
+
+            ipa="$output_dir/Perezvon.ipa"
+            exports=("$project_dir"/export/*.ipa)
+            if [[ ${#exports[@]} -ne 1 || ! -f "${exports[0]}" ]]; then
+              echo "::error::Xcode did not export exactly one IPA."
+              exit 1
+            fi
+            cp "${exports[0]}" "$ipa"
+          else
+            xcodebuild "${xcode_args[@]}" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+
+            app="$project_dir/DerivedData/Build/Products/Release-iphoneos/Perezvon.app"
+            executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")"
+            /usr/bin/lipo -verify_arch arm64 "$app/$executable"
+            mkdir Payload
+            /usr/bin/ditto "$app" Payload/Perezvon.app
+            ipa="$output_dir/Perezvon-unsigned.ipa"
+            /usr/bin/ditto -c -k --keepParent Payload "$ipa"
+          fi
+
+          python3 - "$ipa" <<'CHECK_PY'
+          import plistlib
+          import sys
+          from zipfile import ZipFile
+
+          with ZipFile(sys.argv[1]) as ipa:
+              root = "Payload/Perezvon.app/"
+              bad_entry = ipa.testzip()
+              if bad_entry:
+                  sys.exit(f"Bad IPA entry: {bad_entry}")
+              info = plistlib.loads(ipa.read(root + "Info.plist"))
+              entries = set(ipa.namelist())
+              if root + info["CFBundleExecutable"] not in entries:
+                  sys.exit("The IPA has no app executable.")
+              if info.get("MinimumOSVersion", "").split(".")[0] != "17":
+                  sys.exit("Unexpected minimum iOS version.")
+              if sys.argv[1].endswith("/Perezvon.ipa"):
+                  for entry in ("embedded.mobileprovision", "_CodeSignature/CodeResources"):
+                      if root + entry not in entries:
+                          sys.exit(f"Signed IPA is missing {entry}.")
+          CHECK_PY
+
+          printf 'ipa=%s\n' "$ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA to this workflow run
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.package.outputs.ipa }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
