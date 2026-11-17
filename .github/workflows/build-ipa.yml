@@ -1635,7 +1635,7 @@ jobs:
 
             app="$project_dir/DerivedData/Build/Products/Release-iphoneos/Perezvon.app"
             executable="$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")"
-            /usr/bin/lipo -verify_arch arm64 "$app/$executable"
+            /usr/bin/lipo "$app/$executable" -verify_arch arm64
             mkdir Payload
             /usr/bin/ditto "$app" Payload/Perezvon.app
             ipa="$output_dir/Perezvon-unsigned.ipa"
